@@ -60,10 +60,7 @@ jobs:
           cd "$RUNNER_TEMP/dl"
           megatools dl --no-progress "${{ inputs.url }}"
           ls -la
-          want=$(echo "${{ inputs.sha1 }}" | tr 'A-F' 'a-f')
-          got=$(sha1sum -- * | cut -d' ' -f1)
-          echo "sha1 $got"
-          [ "$got" = "$want" ] || { echo "the file is not the one the release page describes" >&2; exit 1; }
+          echo "ARCHIVE_SHA1=$(sha1sum -- * | cut -d' ' -f1)" >> "$GITHUB_ENV"
           python3 - <<'PY' >> "$GITHUB_ENV"
           import hashlib, json, os
           assets = []
@@ -84,6 +81,12 @@ jobs:
           7z x -o"$RUNNER_TEMP/img" "$first" '*.img' -r
           rm -f ./*
           ls -la "$RUNNER_TEMP/img"
+          # The release page gives one SHA1 without saying whether it is of the
+          # archive or of the image inside it; one of the two has to match.
+          want=$(echo "${{ inputs.sha1 }}" | tr 'A-F' 'a-f')
+          image_sha1=$(sha1sum "$RUNNER_TEMP"/img/*.img | head -1 | cut -d' ' -f1)
+          echo "sha1 archive $ARCHIVE_SHA1, image $image_sha1, release page $want"
+          [ "$ARCHIVE_SHA1" = "$want" ] || [ "$image_sha1" = "$want" ] || { echo "the file is not the one the release page describes" >&2; exit 1; }
           df -h /
       - name: Convert and verify
         run: |
