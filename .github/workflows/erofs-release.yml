@@ -1,0 +1,103 @@
+name: EROFS release
+
+# Started by hand for one dArkOSRE release. dArkOSRE publishes its firmware file
+# as a link on its release page, with a SHA1 beside it; both are given here.
+# Publishing the result is what declares that version usable as a ready-made
+# partition.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: dArkOSRE version, the date in its release name (for example 03082026)
+        required: true
+      tag:
+        description: dArkOSRE release tag the file belongs to (for example dArkOSRE-R36(03082026))
+        required: true
+      url:
+        description: Mega link of the firmware file from that release page
+        required: true
+      sha1:
+        description: SHA1 of the firmware file from that release page
+        required: true
+      revision:
+        description: Our revision of this conversion (raise it to publish again)
+        required: true
+        default: "1"
+      prerelease:
+        description: Publish as a pre-release (installers only take full releases)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: southoz/dArkOSRE-R36
+  DISTRIBUTION: dArkOSRE
+  UPSTREAM_TAG: ${{ inputs.tag }}
+  IMAGE_PREFIX: dArkOSRE_R36
+  VERSION: ${{ inputs.version }}
+  RELEASE_TAG: ${{ inputs.version }}-erofs${{ inputs.revision }}
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: erofs
+      - name: Make room and install tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq erofs-utils p7zip-full btrfs-progs attr fdisk megatools
+          sudo modprobe erofs
+          sudo modprobe btrfs
+          df -h / /mnt
+      - name: Download the dArkOSRE firmware file
+        run: |
+          mkdir -p "$RUNNER_TEMP/dl"
+          cd "$RUNNER_TEMP/dl"
+          megatools dl --no-progress "${{ inputs.url }}"
+          ls -la
+          want=$(echo "${{ inputs.sha1 }}" | tr 'A-F' 'a-f')
+          got=$(sha1sum -- * | cut -d' ' -f1)
+          echo "sha1 $got"
+          [ "$got" = "$want" ] || { echo "the file is not the one the release page describes" >&2; exit 1; }
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import hashlib, json, os
+          assets = []
+          for name in sorted(os.listdir(".")):
+              h = hashlib.sha256()
+              with open(name, "rb") as f:
+                  for block in iter(lambda: f.read(1 << 20), b""):
+                      h.update(block)
+              assets.append({"name": name, "size": os.path.getsize(name), "sha256": h.hexdigest()})
+          print("UPSTREAM_ASSETS=" + json.dumps(assets))
+          PY
+      - name: Unpack the disk image
+        run: |
+          cd "$RUNNER_TEMP/dl"
+          first=$(ls | sort | head -1)
+          7z l "$first" | tail -5
+          mkdir -p "$RUNNER_TEMP/img"
+          7z x -o"$RUNNER_TEMP/img" "$first" '*.img' -r
+          rm -f ./*
+          ls -la "$RUNNER_TEMP/img"
+          df -h /
+      - name: Convert and verify
+        run: |
+          image=$(find "$RUNNER_TEMP/img" -name '*.img' | head -1)
+          mkdir -p "$RUNNER_TEMP/out"
+          sudo --preserve-env=UPSTREAM,UPSTREAM_TAG,UPSTREAM_ASSETS,DISTRIBUTION,IMAGE_PREFIX bash erofs/convert.sh "$image" "$RUNNER_TEMP/out" "$VERSION" "${{ inputs.revision }}"
+          sudo chown -R "$USER" "$RUNNER_TEMP/out"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flag=""
+          [ "${{ inputs.prerelease }}" = "true" ] && flag="--prerelease"
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" $flag \
+            --title "$DISTRIBUTION $VERSION as EROFS (revision ${{ inputs.revision }})" \
+            --notes "The root filesystem of $DISTRIBUTION $VERSION, unchanged, as a compressed read-only EROFS image for andr36oid. Packed with xz; manifest.json lists files, sizes and checksums." \
+            "$RUNNER_TEMP"/out/*
